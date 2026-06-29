@@ -14,7 +14,9 @@ import hashlib
 import base64
 import aiohttp
 import hmac
+from datetime import datetime, timedelta, timezone
 import database
+import link_report
 
 # ============================================================
 # Optional OCR acceleration deps (Pillow + numpy)
@@ -50,6 +52,10 @@ DISCORD_GUILD_ID = int(getattr(config, "DISCORD_GUILD_ID", os.getenv("DISCORD_GU
 
 # Optional: restrict /verify to one channel (0 = allow everywhere)
 VERIFY_CHANNEL_ID = int(getattr(config, "VERIFY_CHANNEL_ID", os.getenv("VERIFY_CHANNEL_ID", "0")) or 0)
+
+# Channel scanned by /108-hours-no-duplicates.
+LINK_REPORT_CHANNEL_ID = 1432842655704027259
+LINK_REPORT_HOURS = 108
 
 # OCR concurrency limiter (important under load)
 OCR_CONCURRENCY = int(getattr(config, "OCR_CONCURRENCY", os.getenv("OCR_CONCURRENCY", "4")) or 4)
@@ -638,8 +644,9 @@ class VerificationResult:
 # ============================================================
 intents = discord.Intents.default()
 intents.guilds = True
-# We intentionally avoid message_content: we do NOT use public chat commands anymore.
-intents.message_content = False
+# Reading link text from channel history requires the privileged Message Content Intent.
+# It must also be enabled for the bot in the Discord developer portal.
+intents.message_content = True
 
 client = discord.Client(intents=intents)
 tree = discord.app_commands.CommandTree(client)
@@ -752,6 +759,95 @@ def build_result_embed(member: discord.Member, x_link: dict | None, result: Veri
 # -----------------------------
 # Slash commands (all ephemeral)
 # -----------------------------
+@tree.command(
+    name="108-hours-no-duplicates",
+    description="Export users who did not post another user's link in the last 108 hours"
+)
+@discord.app_commands.default_permissions(manage_guild=True)
+async def link_report_cmd(interaction: discord.Interaction):
+    """Export one Discord ID per eligible link owner to a CSV file."""
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True
+        )
+        return
+
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message(
+            "You need the **Manage Server** permission to run this report.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    try:
+        channel = client.get_channel(LINK_REPORT_CHANNEL_ID)
+        if channel is None:
+            channel = await client.fetch_channel(LINK_REPORT_CHANNEL_ID)
+
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            await interaction.followup.send(
+                f"<#{LINK_REPORT_CHANNEL_ID}> is not a text channel.",
+                ephemeral=True
+            )
+            return
+
+        if channel.guild.id != interaction.guild.id:
+            await interaction.followup.send(
+                "The report channel does not belong to this server.",
+                ephemeral=True
+            )
+            return
+
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=LINK_REPORT_HOURS)
+        messages_with_links = []
+        scanned_messages = 0
+
+        async for message in channel.history(
+            limit=None,
+            after=cutoff,
+            oldest_first=True
+        ):
+            if message.author.bot:
+                continue
+
+            scanned_messages += 1
+            links = link_report.extract_links(message.content)
+            if links:
+                messages_with_links.append((str(message.author.id), message.content))
+
+        discord_ids = link_report.find_eligible_user_ids(messages_with_links)
+        csv_bytes = link_report.build_discord_id_csv(discord_ids)
+        report_file = discord.File(
+            io.BytesIO(csv_bytes),
+            filename="108-hours-no-duplicates.csv"
+        )
+
+        await interaction.followup.send(
+            (
+                f"Scanned {scanned_messages} messages from the last "
+                f"{LINK_REPORT_HOURS} hours and exported "
+                f"{len(discord_ids)} eligible Discord IDs."
+            ),
+            file=report_file,
+            ephemeral=True
+        )
+    except discord.Forbidden:
+        await interaction.followup.send(
+            (
+                f"I cannot read <#{LINK_REPORT_CHANNEL_ID}>. Grant the bot "
+                "**View Channel** and **Read Message History** permissions."
+            ),
+            ephemeral=True
+        )
+    except discord.HTTPException as exc:
+        await interaction.followup.send(
+            f"Discord could not generate the report: {exc}",
+            ephemeral=True
+        )
+
 @tree.command(name="xlink", description="Link your X account for verification")
 async def xlink_cmd(interaction: discord.Interaction):
     if not interaction.user:
