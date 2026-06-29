@@ -41,3 +41,16 @@ npm run dev
 
 - The worker is stubbed and returns deterministic fake results based on the user ID + link. Replace the stub worker with your real job processor when ready.
 - The bot role must be above the target roles in the Discord role hierarchy to assign them.
+
+## 108-hour link report
+
+Server managers can run `/108-hours-no-duplicates` to scan channel
+`1432842655704027259` for the previous 108 hours. The first user to post a
+normalized link is treated as its owner. A later user who posts that same link
+is excluded; reposting one's own link is allowed. The generated CSV contains
+one `discord_id` column and each eligible user appears once.
+
+The bot needs **View Channel** and **Read Message History** in the report
+channel. The **Message Content Intent** must be enabled in the Discord
+developer portal. Running the command requires **Manage Server**.
+
